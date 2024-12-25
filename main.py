@@ -1,5 +1,6 @@
 import os
 import random
+import asyncio
 from datetime import datetime, timedelta
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram import Update, ReplyKeyboardMarkup
@@ -36,7 +37,6 @@ def fetch_video_ids():
     global video_ids
     try:
         video_ids = []  # Clear the list before updating
-        # Get the latest 100 messages from the private channel (excluding the bot's own messages)
         updates = bot.get_chat_history(chat_id=PRIVATE_CHANNEL_ID, limit=100)
         for update in updates:
             if update.video and update.from_user.id != bot.id:  # Ignore bot's own messages
@@ -144,8 +144,9 @@ async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id
         await update.message.reply_text(f"Daily limit reached! Wait {remaining_time} hours for more videos or purchase premium using /buy command.")
         return
 
-    # Dynamically update the list of available videos
-    fetch_video_ids()
+    # Dynamically update the list of available videos if needed
+    if not video_ids:
+        fetch_video_ids()
 
     # Check if there are videos available
     if not video_ids:
@@ -170,6 +171,13 @@ async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id
     except Exception as e:
         await update.message.reply_text(f"Failed to send video: {e}")
 
+# Background task to fetch videos every 5 minutes
+async def fetch_videos_periodically():
+    while True:
+        fetch_video_ids()
+        print("Fetched videos from private channel.")
+        await asyncio.sleep(300)  # Sleep for 5 minutes (300 seconds)
+
 def main():
     """Start the bot."""
     print("Bot is running... Press Ctrl+C to stop.")
@@ -183,9 +191,12 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply))
 
     # Run the bot
+    asyncio.create_task(fetch_videos_periodically())  # Start the background task for fetching videos
     application.run_polling()
 
 # Run the Flask app
 if __name__ == "__main__":
+    # Fetch videos initially when the bot starts
+    fetch_video_ids()  
     main()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))

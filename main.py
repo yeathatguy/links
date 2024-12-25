@@ -1,6 +1,5 @@
 import os
 import random
-import json
 from datetime import datetime, timedelta
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram import Update, ReplyKeyboardMarkup
@@ -9,25 +8,21 @@ from googleapiclient.errors import HttpError
 from google.oauth2.service_account import Credentials
 from googleapiclient.http import MediaIoBaseDownload
 
-# Google Drive Setup - Using environment variable for service account credentials
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+# Environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", 3))  # Default limit is 3 if not set
+TEMP_VIDEO_PATH = os.getenv("TEMP_VIDEO_PATH", "New folder")
 
-# Load the JSON credentials from the environment variable
-google_service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+# Initialize Google Drive API
+credentials = Credentials.from_service_account_info(
+    eval(GOOGLE_SERVICE_ACCOUNT_JSON),  # Parse the JSON string from environment variable
+    scopes=["https://www.googleapis.com/auth/drive.readonly"]
+)
+drive_service = build('drive', 'v3', credentials=credentials)
 
-# Parse the JSON string and create credentials
-if google_service_account_json:
-    credentials = Credentials.from_service_account_info(json.loads(google_service_account_json), scopes=SCOPES)
-    drive_service = build('drive', 'v3', credentials=credentials)
-else:
-    raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable is not set or invalid.")
-
-# Path to store the video file temporarily (make sure this folder exists)
-TEMP_VIDEO_PATH = 'New folder'
+# Ensure the temporary folder exists
 os.makedirs(TEMP_VIDEO_PATH, exist_ok=True)
-
-# Daily limit for videos
-DAILY_LIMIT = 3
 
 # Track user limits and sent videos
 user_limits = {}
@@ -50,7 +45,7 @@ def download_video(file_id):
         with open(file_path, 'wb') as f:
             downloader = MediaIoBaseDownload(f, request)
             done = False
-            while done is False:
+            while not done:
                 status, done = downloader.next_chunk()
             return file_path
     except HttpError as error:
@@ -159,12 +154,10 @@ async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id
 
 def main():
     """Start the bot."""
-    TOKEN = "7729201549:AAFnO5jwoPbMiyjh7nb8GVVatH2ajcBMZE0"
-
     print("Bot is running... Press Ctrl+C to stop.")
 
     # Create the application
-    application = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start))

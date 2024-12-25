@@ -7,12 +7,15 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.service_account import Credentials
 from googleapiclient.http import MediaIoBaseDownload
+import requests
 
 # Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", 3))  # Default limit is 3 if not set
 TEMP_VIDEO_PATH = os.getenv("TEMP_VIDEO_PATH", "New folder")
+NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Webhook URL for Render deployment
 
 # Initialize Google Drive API
 credentials = Credentials.from_service_account_info(
@@ -24,8 +27,9 @@ drive_service = build('drive', 'v3', credentials=credentials)
 # Ensure the temporary folder exists
 os.makedirs(TEMP_VIDEO_PATH, exist_ok=True)
 
-# Track user limits and sent videos
+# Track user limits and subscriptions
 user_limits = {}
+user_subscriptions = {}
 
 # Function to get list of video file ids from Google Drive
 def get_video_files():
@@ -57,6 +61,44 @@ def clean_temp_folder(file_path):
     if os.path.exists(file_path):
         os.remove(file_path)
 
+# Create a payment link
+def create_payment(user_id):
+    url = "https://api.nowpayments.io/v1/invoice"
+    headers = {
+        "x-api-key": NOWPAYMENTS_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "price_amount": 99,  # Price in INR
+        "price_currency": "inr",
+        "order_id": f"user_{user_id}_{int(datetime.now().timestamp())}",
+        "order_description": "Premium Plan for 1 month",
+        "success_url": f"https://t.me/<your_bot_username>",  # Replace with your bot link
+        "ipn_callback_url": WEBHOOK_URL,  # Render webhook URL for payment notifications
+    }
+    response = requests.post(url, json=payload, headers=headers)
+    if response.status_code == 200:
+        return response.json().get("invoice_url")
+    else:
+        print(f"Error creating payment: {response.text}")
+        return None
+
+# Handle webhook notifications
+from flask import Flask, request
+
+app = Flask(__name__)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.json
+    if data.get('payment_status') == 'finished':
+        order_id = data.get('order_id')
+        user_id = int(order_id.split("_")[1])  # Extract user ID from order ID
+        # Activate premium plan
+        user_subscriptions[user_id] = datetime.now() + timedelta(days=30)  # Premium valid for 1 month
+        print(f"Payment successful for user {user_id}")
+    return "OK", 200
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a welcome message with reply keyboard."""
     chat_id = update.effective_chat.id
@@ -70,9 +112,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=chat_id, text="Welcome! Choose an option below:", reply_markup=reply_markup)
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message for purchasing premium."""
+    """Generate and send a payment link for purchasing premium."""
     chat_id = update.effective_chat.id
-    await context.bot.send_message(chat_id=chat_id, text="Buy premium for 99/- to unlock unlimited videos!")
+    payment_url = create_payment(chat_id)
+    if payment_url:
+        await context.bot.send_message(chat_id=chat_id, text=f"Buy premium for ₹99 using this link: {payment_url}")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text="Failed to generate payment link. Please try again later.")
 
 async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle user replies from the reply keyboard."""
@@ -82,24 +128,30 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_text == "Get Video 🍒":
         await send_video(update, context, user_id)
     elif user_text == "View Plan 💵":
-        await update.message.reply_text("Buy premium for 99/- using /buy command.")
+        await update.message.reply_text("Buy premium for ₹99 using /buy command.")
     else:
         await update.message.reply_text("Please use the provided buttons.")
 
 async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Send a random video, prioritizing unsent videos and respecting daily limits."""
-    global user_limits
+    global user_limits, user_subscriptions
+
+    # Check if user is premium
+    now = datetime.now()
+    if user_id in user_subscriptions and user_subscriptions[user_id] > now:
+        limit = 100
+    else:
+        limit = DAILY_LIMIT
 
     # Initialize user data if not present
     if user_id not in user_limits:
         user_limits[user_id] = {
             "count": 0,
-            "reset_time": datetime.now(),
+            "reset_time": now,
             "sent_videos": set()
         }
 
     user_data = user_limits[user_id]
-    now = datetime.now()
 
     # Reset daily limit if the time has passed
     if now >= user_data["reset_time"]:
@@ -108,7 +160,7 @@ async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id
         user_data["sent_videos"] = set()
 
     # Check if daily limit is reached
-    if user_data["count"] >= DAILY_LIMIT:
+    if user_data["count"] >= limit:
         remaining_time = (user_data["reset_time"] - now).seconds // 3600
         await update.message.reply_text(f"Daily limit reached! Wait {remaining_time} hours for more videos or purchase premium using /buy command.")
         return

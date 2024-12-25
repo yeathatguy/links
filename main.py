@@ -3,27 +3,20 @@ import random
 from datetime import datetime, timedelta
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram import Update, ReplyKeyboardMarkup
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from google.oauth2.service_account import Credentials
-from googleapiclient.http import MediaIoBaseDownload
 import requests
 from flask import Flask, request
 
 # Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", 3))  # Default limit is 3 if not set
 TEMP_VIDEO_PATH = os.getenv("TEMP_VIDEO_PATH", "New folder")
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Webhook URL for Render deployment
+PRIVATE_CHANNEL_ID = os.getenv("PRIVATE_CHANNEL_ID")  # Your private channel ID
 
-# Initialize Google Drive API
-credentials = Credentials.from_service_account_info(
-    eval(GOOGLE_SERVICE_ACCOUNT_JSON),  # Parse the JSON string from environment variable
-    scopes=["https://www.googleapis.com/auth/drive.readonly"]
-)
-drive_service = build('drive', 'v3', credentials=credentials)
+# Initialize Telegram Bot API
+from telegram import Bot
+bot = Bot(token=BOT_TOKEN)
 
 # Ensure the temporary folder exists
 os.makedirs(TEMP_VIDEO_PATH, exist_ok=True)
@@ -35,35 +28,17 @@ user_subscriptions = {}
 # Flask app for webhook
 app = Flask(__name__)
 
-# Function to get list of video file ids from Google Drive
-def get_video_files():
-    try:
-        results = drive_service.files().list(q="mimeType contains 'video/'", fields="files(id, name)").execute()
-        items = results.get('files', [])
-        return items
-    except HttpError as error:
-        print(f"An error occurred: {error}")
-        return []
+# Track video IDs from private channel
+video_ids = []
 
-# Function to download video from Google Drive
-def download_video(file_id):
-    try:
-        request = drive_service.files().get_media(fileId=file_id)
-        file_path = os.path.join(TEMP_VIDEO_PATH, f"{file_id}.mp4")
-        with open(file_path, 'wb') as f:
-            downloader = MediaIoBaseDownload(f, request)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-            return file_path
-    except HttpError as error:
-        print(f"An error occurred: {error}")
-        return None
-
-# Function to clean up the temporary folder after video has been sent
-def clean_temp_folder(file_path):
-    if os.path.exists(file_path):
-        os.remove(file_path)
+# Function to get video IDs from the private channel
+def fetch_video_ids():
+    global video_ids
+    # Get the latest 100 messages from the private channel (excluding the bot's own messages)
+    updates = bot.get_chat_history(chat_id=PRIVATE_CHANNEL_ID, limit=100)
+    for update in updates:
+        if update.video and update.from_user.id != bot.id:  # Ignore bot's own messages
+            video_ids.append(update.video.file_id)
 
 # Create a payment link
 def create_payment(user_id):
@@ -133,8 +108,8 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please use the provided buttons.")
 
 async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Send a random video, prioritizing unsent videos and respecting daily limits."""
-    global user_limits, user_subscriptions
+    """Send a random video from the private Telegram channel, respecting daily limits."""
+    global user_limits, user_subscriptions, video_ids
 
     # Check if user is premium
     now = datetime.now()
@@ -165,41 +140,25 @@ async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id
         await update.message.reply_text(f"Daily limit reached! Wait {remaining_time} hours for more videos or purchase premium using /buy command.")
         return
 
-    # Get the list of videos from Google Drive
-    video_files = get_video_files()
-
-    if not video_files:
-        await update.message.reply_text("No videos found in your Google Drive folder.")
+    # Check if there are videos available
+    if not video_ids:
+        await update.message.reply_text("No videos found in the private Telegram channel.")
         return
 
-    # Remove already sent videos from the list
-    unsent_videos = [video for video in video_files if video['id'] not in user_data["sent_videos"]]
-
+    # Select the next unsent video
+    unsent_videos = [video for video in video_ids if video not in user_data["sent_videos"]]
     if not unsent_videos:
         await update.message.reply_text("All videos have been sent. Please try again tomorrow or purchase premium.")
         return
 
-    # Select the next unsent video
     selected_video = random.choice(unsent_videos)
-    video_file_id = selected_video['id']
-
-    # Download the video
-    video_path = download_video(video_file_id)
-    if not video_path:
-        await update.message.reply_text("Failed to download the video.")
-        return
-
     try:
-        # Open the video file and send it
-        with open(video_path, "rb") as video_file:
-            await context.bot.send_video(chat_id=update.effective_chat.id, video=video_file)
+        # Send the selected video from the private channel
+        await context.bot.send_video(chat_id=update.effective_chat.id, video=selected_video)
 
         # Update user data
         user_data["count"] += 1
-        user_data["sent_videos"].add(video_file_id)
-
-        # Clean up the temporary folder after sending the video
-        clean_temp_folder(video_path)
+        user_data["sent_videos"].add(selected_video)
 
     except Exception as e:
         await update.message.reply_text(f"Failed to send video: {e}")
@@ -219,9 +178,8 @@ def main():
     # Run the bot
     application.run_polling()
 
-if __name__ == "__main__":
-    main()
-
 # Run the Flask app
 if __name__ == "__main__":
+    fetch_video_ids()  # Fetch video IDs from the private channel on bot start
+    main()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))

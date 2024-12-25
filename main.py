@@ -8,6 +8,7 @@ from googleapiclient.errors import HttpError
 from google.oauth2.service_account import Credentials
 from googleapiclient.http import MediaIoBaseDownload
 import requests
+from flask import Flask, request
 
 # Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -30,6 +31,9 @@ os.makedirs(TEMP_VIDEO_PATH, exist_ok=True)
 # Track user limits and subscriptions
 user_limits = {}
 user_subscriptions = {}
+
+# Flask app for webhook
+app = Flask(__name__)
 
 # Function to get list of video file ids from Google Drive
 def get_video_files():
@@ -84,10 +88,6 @@ def create_payment(user_id):
         return None
 
 # Handle webhook notifications
-from flask import Flask, request
-
-app = Flask(__name__)
-
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
@@ -139,7 +139,7 @@ async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id
     # Check if user is premium
     now = datetime.now()
     if user_id in user_subscriptions and user_subscriptions[user_id] > now:
-        limit = 100
+        limit = 100  # Premium users have 100 videos per day
     else:
         limit = DAILY_LIMIT
 
@@ -221,3 +221,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Run the Flask app
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))

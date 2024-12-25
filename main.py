@@ -1,24 +1,66 @@
 import os
 import random
+import json
 from datetime import datetime, timedelta
-from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from flask import Flask, request, jsonify
+from telegram import Update, ReplyKeyboardMarkup
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from google.oauth2.service_account import Credentials
+from googleapiclient.http import MediaIoBaseDownload
 
-# Flask app for handling the webhook
-app = Flask(__name__)
+# Google Drive Setup - Using environment variable for service account credentials
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
-# Path to your video folder
-VIDEO_FOLDER = r"C:\Users\vivek\Downloads\Videos"
+# Load the JSON credentials from the environment variable
+google_service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
 
-# Daily limit for free users
+# Parse the JSON string and create credentials
+if google_service_account_json:
+    credentials = Credentials.from_service_account_info(json.loads(google_service_account_json), scopes=SCOPES)
+    drive_service = build('drive', 'v3', credentials=credentials)
+else:
+    raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable is not set or invalid.")
+
+# Path to store the video file temporarily (make sure this folder exists)
+TEMP_VIDEO_PATH = 'New folder'
+os.makedirs(TEMP_VIDEO_PATH, exist_ok=True)
+
+# Daily limit for videos
 DAILY_LIMIT = 3
 
 # Track user limits and sent videos
 user_limits = {}
 
-# NOWPayments API Key
-NOWPAYMENTS_API_KEY = "YOUR_NOWPAYMENTS_API_KEY"
+# Function to get list of video file ids from Google Drive
+def get_video_files():
+    try:
+        results = drive_service.files().list(q="mimeType contains 'video/'", fields="files(id, name)").execute()
+        items = results.get('files', [])
+        return items
+    except HttpError as error:
+        print(f"An error occurred: {error}")
+        return []
+
+# Function to download video from Google Drive
+def download_video(file_id):
+    try:
+        request = drive_service.files().get_media(fileId=file_id)
+        file_path = os.path.join(TEMP_VIDEO_PATH, f"{file_id}.mp4")
+        with open(file_path, 'wb') as f:
+            downloader = MediaIoBaseDownload(f, request)
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+            return file_path
+    except HttpError as error:
+        print(f"An error occurred: {error}")
+        return None
+
+# Function to clean up the temporary folder after video has been sent
+def clean_temp_folder(file_path):
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a welcome message with reply keyboard."""
@@ -33,14 +75,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=chat_id, text="Welcome! Choose an option below:", reply_markup=reply_markup)
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message with payment details."""
+    """Send a message for purchasing premium."""
     chat_id = update.effective_chat.id
-    # Payment link for NOWPayments (use your API or specific link)
-    payment_link = "https://nowpayments.io/payment-url"  # Replace with your generated payment URL
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"Buy premium for 99/- using this link: {payment_link}. Once paid, you will get access to 100 videos/day for one month!"
-    )
+    await context.bot.send_message(chat_id=chat_id, text="Buy premium for 99/- to unlock unlimited videos!")
 
 async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle user replies from the reply keyboard."""
@@ -63,8 +100,7 @@ async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id
         user_limits[user_id] = {
             "count": 0,
             "reset_time": datetime.now(),
-            "sent_videos": set(),
-            "premium": False  # Default to non-premium
+            "sent_videos": set()
         }
 
     user_data = user_limits[user_id]
@@ -76,67 +112,54 @@ async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id
         user_data["reset_time"] = now + timedelta(days=1)
         user_data["sent_videos"] = set()
 
-    # Set daily limit based on premium status
-    daily_limit = 100 if user_data.get("premium", False) else DAILY_LIMIT
-
     # Check if daily limit is reached
-    if user_data["count"] >= daily_limit:
+    if user_data["count"] >= DAILY_LIMIT:
         remaining_time = (user_data["reset_time"] - now).seconds // 3600
-        await update.message.reply_text(
-            f"Daily limit reached! Wait {remaining_time} hours for more videos or purchase premium using /buy command."
-        )
+        await update.message.reply_text(f"Daily limit reached! Wait {remaining_time} hours for more videos or purchase premium using /buy command.")
         return
 
-    # Get list of videos from the folder
-    try:
-        video_files = [f for f in os.listdir(VIDEO_FOLDER) if f.endswith((".mp4", ".avi", ".mkv"))]
-        if not video_files:
-            await update.message.reply_text("No videos found in the folder. Please check the path!")
-            return
-    except Exception as e:
-        await update.message.reply_text(f"Error accessing video folder: {e}")
+    # Get the list of videos from Google Drive
+    video_files = get_video_files()
+
+    if not video_files:
+        await update.message.reply_text("No videos found in your Google Drive folder.")
         return
 
-    # Split videos into unsent and already sent
-    unsent_videos = [video for video in video_files if video not in user_data["sent_videos"]]
-    sent_videos = [video for video in video_files if video in user_data["sent_videos"]]
+    # Remove already sent videos from the list
+    unsent_videos = [video for video in video_files if video['id'] not in user_data["sent_videos"]]
 
-    # Merge unsent first, followed by sent
-    prioritized_videos = unsent_videos + sent_videos
-
-    if not prioritized_videos:
-        await update.message.reply_text("No videos available. Please try again later!")
+    if not unsent_videos:
+        await update.message.reply_text("All videos have been sent. Please try again tomorrow or purchase premium.")
         return
 
-    # Select the next video and send it
-    selected_video = prioritized_videos[0]  # Send the next video in the priority list
-    video_path = os.path.join(VIDEO_FOLDER, selected_video)
+    # Select the next unsent video
+    selected_video = random.choice(unsent_videos)
+    video_file_id = selected_video['id']
+
+    # Download the video
+    video_path = download_video(video_file_id)
+    if not video_path:
+        await update.message.reply_text("Failed to download the video.")
+        return
 
     try:
-        await context.bot.send_video(chat_id=update.effective_chat.id, video=open(video_path, "rb"))
+        # Open the video file and send it
+        with open(video_path, "rb") as video_file:
+            await context.bot.send_video(chat_id=update.effective_chat.id, video=video_file)
+
         # Update user data
         user_data["count"] += 1
-        user_data["sent_videos"].add(selected_video)
+        user_data["sent_videos"].add(video_file_id)
+
+        # Clean up the temporary folder after sending the video
+        clean_temp_folder(video_path)
+
     except Exception as e:
         await update.message.reply_text(f"Failed to send video: {e}")
 
-@app.route('/webhook', methods=['POST'])
-def handle_webhook():
-    """Handle payment success notifications from NOWPayments."""
-    global user_limits
-
-    data = request.json
-    if data.get("payment_status") == "finished":
-        user_id = int(data.get("order_id"))  # Order ID is the user_id in this implementation
-        if user_id in user_limits:
-            user_limits[user_id]["premium"] = True
-            user_limits[user_id]["reset_time"] = datetime.now() + timedelta(days=30)  # Premium valid for 30 days
-            user_limits[user_id]["count"] = 0  # Reset video count
-    return jsonify({"status": "success"})
-
 def main():
     """Start the bot."""
-    TOKEN = "YOUR_BOT_TOKEN"
+    TOKEN = "7729201549:AAFnO5jwoPbMiyjh7nb8GVVatH2ajcBMZE0"
 
     print("Bot is running... Press Ctrl+C to stop.")
 
@@ -152,11 +175,4 @@ def main():
     application.run_polling()
 
 if __name__ == "__main__":
-    from threading import Thread
-
-    # Run Flask app in a separate thread
-    thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000))
-    thread.start()
-
-    # Start the bot
     main()

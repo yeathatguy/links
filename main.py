@@ -31,14 +31,18 @@ app = Flask(__name__)
 # Track video IDs from private channel
 video_ids = []
 
-# Function to get video IDs from the private channel
+# Function to get video IDs from the private channel, excluding bot's own messages
 def fetch_video_ids():
     global video_ids
-    # Get the latest 100 messages from the private channel (excluding the bot's own messages)
-    updates = bot.get_chat_history(chat_id=PRIVATE_CHANNEL_ID, limit=100)
-    for update in updates:
-        if update.video and update.from_user.id != bot.id:  # Ignore bot's own messages
-            video_ids.append(update.video.file_id)
+    try:
+        video_ids = []  # Clear the list before updating
+        # Get the latest 100 messages from the private channel (excluding the bot's own messages)
+        updates = bot.get_chat_history(chat_id=PRIVATE_CHANNEL_ID, limit=100)
+        for update in updates:
+            if update.video and update.from_user.id != bot.id:  # Ignore bot's own messages
+                video_ids.append(update.video.file_id)
+    except Exception as e:
+        print(f"Error fetching videos from private channel: {e}")
 
 # Create a payment link
 def create_payment(user_id):
@@ -140,6 +144,9 @@ async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id
         await update.message.reply_text(f"Daily limit reached! Wait {remaining_time} hours for more videos or purchase premium using /buy command.")
         return
 
+    # Dynamically update the list of available videos
+    fetch_video_ids()
+
     # Check if there are videos available
     if not video_ids:
         await update.message.reply_text("No videos found in the private Telegram channel.")
@@ -180,6 +187,5 @@ def main():
 
 # Run the Flask app
 if __name__ == "__main__":
-    fetch_video_ids()  # Fetch video IDs from the private channel on bot start
     main()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
